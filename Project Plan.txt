@@ -1,0 +1,7 @@
+Goals:
+1. Model single threaded execution and prove correctness.
+
+
+Model Aspects:
+1. Program state:
+  a. 
