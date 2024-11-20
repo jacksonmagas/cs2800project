@@ -88,3 +88,4 @@ void ThreadedFileWriter::write(std::byte* source, size_t num_bytes)
         }
     }
 }
+
