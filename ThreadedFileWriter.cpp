@@ -4,12 +4,16 @@
 
 void ThreadedFileWriter::write_worker()
 {
+    // changed to local as a result of modeling showing it only used here
+    size_t file_write_idx = 0;
     while (true) {
         std::unique_lock mtx(mtxs[file_write_idx], std::defer_lock);
         std::unique_lock lock(writing_mtx);
         if (writing) {
+            // if we are writing then block until we are not writing
             mtx.lock();
         } else {
+            // if we are not writing then we should be able to get the mtx unless we are done
             if (!mtx.try_lock()) {
                 return;
             }

@@ -13,9 +13,6 @@ class ThreadedFileWriter {
     const size_t buffsize;
     const size_t num_buffs;
     
-    //which buffer the write worker is writing to file write next when it fills
-    size_t file_write_idx;
-    
     //which buffer will be filled next with data
     size_t buffer_write_idx;
     
