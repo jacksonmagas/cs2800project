@@ -60,10 +60,9 @@ ThreadedFileWriter::~ThreadedFileWriter()
     mtxs[buffer_write_idx].lock();
     lock.unlock();
     //write thread finish writing to file and end thread
-    if (write_thread.joinable()) {
-        DEBUGLOG("Waiting for Write Thread");
-        write_thread.join();
-    }
+    // removed if write_thread.joinable as redundant due to formal modeling
+    DEBUGLOG("Waiting for Write Thread");
+    write_thread.join();
     //unlock the last mutex
     mtxs[buffer_write_idx].unlock();
     DEBUGLOG("Closing File");

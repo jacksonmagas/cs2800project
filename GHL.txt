@@ -1,0 +1,17 @@
+Not going to acutally use this, but was a good read
+
+
+The cpp file is described in terms of the Generalized Hoare Logic as described by Leslie Lamport in
+the 1984 ACM 0164-0925/84/0400-0281 The "Hoare Logic" of CSP, and All That.
+
+A required assumption for the analysis of concurrent programs is specifying atomic actions, which have no intermediate steps.
+I will follow Lamport's notation by denoting atomic actions with angle brackets <action>.
+
+Thread Primitives are implemented based on the rule that atomic actions can only be executed if they will terminate.
+The postcondition will include error != 1.
+A mutex m_i can be implemented with the following operations:
+Lock: will always check if this thread owns the mutex, then will wait for mutex to be free
+<if m_i = thread_id then error := 1 else skip>; <while m_i != 0 do skip; m_i := thread_id>
+Unlock:
+<if m_i = thread_id then m_i := 0 else error := 1>
+
