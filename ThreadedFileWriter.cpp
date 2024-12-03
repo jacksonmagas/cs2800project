@@ -5,6 +5,7 @@
 void ThreadedFileWriter::write_worker()
 {
     // changed to local as a result of modeling showing it only used here
+    // the number of the buffer to try and write to file next
     size_t file_write_idx = 0;
     while (true) {
         std::unique_lock mtx(mtxs[file_write_idx], std::defer_lock);

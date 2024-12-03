@@ -22,14 +22,16 @@ At the end of the destructor the outfile also needs to exactly match the history
 |#
 
 (modeling-validate-defs)
+(acl2s-defaults :set testing-enabled nil)
+(set-defunc-function-contract-strictp nil)
+(set-defunc-body-contracts-strictp nil)
 
 
 (def-const *write-thread-id* 17)
 (def-const *read-thread-id* 23)
 
 ;; this type was potentially causing crashes because very large test values were being chosen
-;; (defdata size-t (range integer (0 <= _ < (expt 2 64))))
-(defdata size-t nat)
+(defdata size-t (range integer (0 <= _ < (expt 2 64))))
 (defdata local-unsigned (or nil size-t))
 (definec u+ (l r :size-t) :size-t (mod (+ l r) (expt 2 64)))
 (definec u- (l r :size-t) :size-t (mod (- l r) (expt 2 64)))
@@ -75,7 +77,7 @@ At the end of the destructor the outfile also needs to exactly match the history
 (defdata 
   ;; a thread has an id, and its local state
   thread (record (id . nat)
-                 (action-num . nat)
+                 (atomic-num . nat)
                  (locals . local-state)))
 (defdata maybe-thread (or nil thread))
 
@@ -100,7 +102,7 @@ At the end of the destructor the outfile also needs to exactly match the history
                        (read-thread . maybe-thread)
                        (pending-writes . write-list)))
 
-(defdata error 'locking-owned-mtx)
+(defdata error (or 'locking-owned-mtx 'writing-to-closed-file 'memory-access-error))
 ;; the result can be a state, or a type of error
 (defdata result (oneof globals error))
 
@@ -117,8 +119,9 @@ At the end of the destructor the outfile also needs to exactly match the history
   (v (endp w) (^ (size-tp (llen (car w))) (all-size-t (cdr w)))))
 
 
-(defmacro make-read (num mtx f-w-index)
-  `(thread ,*read-thread-id* ,num (write-worker ,mtx ,f-w-index)))
+;; helper for making read threads
+(definec make-read (num :size-t m :maybe-mtx f-w-index :local-unsigned) :thread
+  `(thread ,*read-thread-id* ,num (write-worker ,m ,f-w-index)))
 
 
 ;; constructor is not simulated line by line, instead used to generate initial global state
@@ -154,134 +157,244 @@ At the end of the destructor the outfile also needs to exactly match the history
              '()
              new-write-thread
              new-read-thread
-             pending-writes)))#|ACL2s-ToDo-Line|#
-
+             pending-writes))
+  :skip-function-contractp t
+  :skip-tests t)
 
 ;; update state by giving current state and a list of pairs like '(writing . nil) or '(buffsize . 5)
-(defmacro update (state &rest rst)
-  (declare (xargs :guard (alistp rst)))
+(definec update (lstate :globals rst :alist) :globals
   (let ((writing (if (assoc 'writing rst) 
-                     (cdr (assoc 'writing rst)) 
-                     (globals-writing state)))
+                   (cdr (assoc 'writing rst)) 
+                   (globals-writing lstate)))
         (writing-mtx (if (assoc 'writing-mtx rst) 
-                         (cdr (assoc 'writing-mtx rst)) 
-                         (globals-writing-mtx state)))
+                       (cdr (assoc 'writing-mtx rst)) 
+                       (globals-writing-mtx lstate)))
         (buffsize (if (assoc 'buffsize rst) 
-                      (cdr (assoc 'buffsize rst)) 
-                      (globals-buffsize state)))
+                    (cdr (assoc 'buffsize rst)) 
+                    (globals-buffsize lstate)))
         (num-buffs (if (assoc 'num-buffs rst) 
-                       (cdr (assoc 'num-buffs rst)) 
-                       (globals-num-buffs state)))
-        (buffer-byte-idx (if (assoc 'buffer-byte-idx rst) 
-                             (cdr (assoc 'buffer-byte-idx rst)) 
-                             (globals-buffer-byte-idx state)))
+                     (cdr (assoc 'num-buffs rst)) 
+                     (globals-num-buffs lstate)))
+        (buffer-write-idx (if (assoc 'buffer-write-idx rst) 
+                            (cdr (assoc 'buffer-write-idx rst)) 
+                            (globals-buffer-byte-idx lstate)))
+        (buffer-byte-idx (if (assoc 'buffer-write-idx rst) 
+                           (cdr (assoc 'buffer-byte-idx rst)) 
+                           (globals-buffer-byte-idx lstate)))
         (mtxs (if (assoc 'mtxs rst) 
-                  (cdr (assoc 'mtxs rst)) 
-                  (globals-mtxs state)))
+                (cdr (assoc 'mtxs rst)) 
+                (globals-mtxs lstate)))
         (outfile (if (assoc 'outfile rst) 
-                     (cdr (assoc 'outfile rst)) 
-                     (globals-outfile state)))
+                   (cdr (assoc 'outfile rst)) 
+                   (globals-outfile lstate)))
         (buffer-start (if (assoc 'buffer-start rst) 
-                          (cdr (assoc 'buffer-start rst)) 
-                          (globals-buffer-start state)))
+                        (cdr (assoc 'buffer-start rst)) 
+                        (globals-buffer-start lstate)))
         (buffer-end (if (assoc 'buffer-end rst) 
-                        (cdr (assoc 'buffer-end rst)) 
-                        (globals-buffer-end state)))
+                      (cdr (assoc 'buffer-end rst)) 
+                      (globals-buffer-end lstate)))
         (memory (if (assoc 'memory rst) 
-                    (cdr (assoc 'memory rst)) 
-                    (globals-memory state)))
+                  (cdr (assoc 'memory rst)) 
+                  (globals-memory lstate)))
         (write-thread (if (assoc 'write-thread rst) 
-                          (cdr (assoc 'write-thread rst)) 
-                          (globals-write-thread state)))
+                        (cdr (assoc 'write-thread rst)) 
+                        (globals-write-thread lstate)))
         (read-thread (if (assoc 'read-thread rst) 
-                         (cdr (assoc 'read-thread rst)) 
-                         (globals-read-thread state)))
+                       (cdr (assoc 'read-thread rst)) 
+                       (globals-read-thread lstate)))
         (pending-writes (if (assoc 'read-thread rst) 
-                         (cdr (assoc 'pending-writes rst)) 
-                         (globals-read-thread state))))
-    `(globals ,writing ,writing-mtx ,buffsize ,num-buffs ,buffer-byte-idx
-                   ,mtxs ,outfile ,buffer-start ,buffer-end 
-                   ,memory ,write-thread ,read-thread ,pending-writes)))
+                          (cdr (assoc 'pending-writes rst)) 
+                          (globals-read-thread lstate))))
+    (globals writing writing-mtx buffsize num-buffs buffer-write-idx
+             buffer-byte-idx mtxs outfile buffer-start buffer-end 
+             memory write-thread read-thread pending-writes)))
+
+(defdata bits-error (or bits error))
+;; get the memory from a buffer
+(definec mem-get (mem :indexed-list start-idx end-idx :size-t) :bits-error
+  (if (= start-idx end-idx)
+    '()
+    (if (^ (assoc start-idx mem) (! (errorp (mem-get mem (1+ start-idx) end-idx))))
+      (cons (assoc start-idx mem) (mem-get mem (1+ start-idx) end-idx))
+      'memory-access-error)))
 
 #|
 void ThreadedFileWriter::write_worker()
 {
-0    while (true) {
+0    size_t file_write_idx = 0;
+1    while (true) {
          // update mtx in the local state to be the mutex from the array
          // file write index must not change while in line 1
-1        std::unique_lock mtx(mtxs[file_write_idx], std::defer_lock);
+2        std::unique_lock mtx(mtxs[file_write_idx], std::defer_lock);
          // attempt to aquire writing mtx
-2        std::unique_lock lock(writing_mtx);
+3        std::unique_lock lock(writing_mtx);
          // writing var can't be modified while on line 3
-3        if (writing) {
-4            mtx.lock();
+4        if (writing) {
+5            mtx.lock();
          } else {
              // lock must not be owned by read thread when we try locking it
-5            if (!mtx.try_lock()) {
+6            if (!mtx.try_lock()) {
                  // unlock lock
-6                return;
+7                return;
              }
          }
          try {
              // for now assuming that write cannot fail, can possibly look at that later
-7            outfile.write(reinterpret_cast<char*>(buffer.get() + (buffsize * file_write_idx)), buffsize);
+8            outfile.write(reinterpret_cast<char*>(buffer.get() + (buffsize * file_write_idx)), buffsize);
          } catch(const std::exception& e) {
-8            std::cerr << "Exception " << e.what() << " while writing to file.";
-9            return;
+9            std::cerr << "Exception " << e.what() << " while writing to file.";
+10           return;
          }
-10       file_write_idx = (file_write_idx + 1) % num_buffs;
+11      file_write_idx = (file_write_idx + 1) % num_buffs;
       }
 }
 |#
 ;; take the state and execute an action for write worker, returning the new state or an error
-(definec step-write-worker (state :globals) :result
+(definec step-write-worker (prog-state :globals) :result
   ;; the read thread has to be in write worker
-  :ic (^ (globals-read-thread state) (write-workerp (thread-locals (globals-read-thread state))))
-  (let* ((thread (globals-read-thread state))
-         (id (thread-id thread))
-         (line-num (thread-action-num thread))
+  :ic (^ (globals-read-thread prog-state) (write-workerp (thread-locals (globals-read-thread prog-state))))
+  (let* ((thread (globals-read-thread prog-state))
+         (line-num (thread-atomic-num thread))
          (locals (thread-locals thread))
          (f-w-index (write-worker-file-write-index locals))
          (mtx (write-worker-local-mtx locals))
-         (mtxs (globals-mtxs state))
-         (writing-mtx (globals-writing-mtx state))
-         (writing (globals-writing state)))
+         (mtxs (globals-mtxs prog-state))
+         (writing-mtx (globals-writing-mtx prog-state))
+         (writing (globals-writing prog-state))
+         (file (globals-outfile prog-state))
+         (mem (globals-memory prog-state))
+         (buff-start (globals-buffer-start prog-state))
+         (buffsize (globals-buffsize prog-state))
+         (num-buffs (globals-num-buffs prog-state)))
     (match line-num
-      (0 (update state `(read-thread . ,(thread id 1 mtx))))
-      ;; just set local mtx variable
-      (1 (update state `(read-thread . ,(thread id 2 (nth f-w-index mtxs)))))
-      ;; attempt to aquire writing mtx, if it is free lock it and step line num, if it is owned by another thread block,
-      ;; if it is owned by this thread that is an ERROR
-      (2 (if (!= writing-mtx 'free)
+      ;; initialize file write index to 0
+      (0 (update prog-state `((read-thread . ,(make-read 1 mtx 0)))))
+      ;; just step line
+      (1 (update prog-state `((read-thread . ,(make-read 2 mtx f-w-index)))))
+       ;; set local mtx variable
+      (2 (update prog-state `((read-thread . ,(make-read 3 (nth f-w-index mtxs) f-w-index)))))
+       ;; attempt to aquire writing mtx, if it is free lock it and step line num, if it is owned by another thread block,
+       ;; if it is owned by this thread that is an ERROR
+      (3 (if (!= writing-mtx 'free)
            (if (== writing-mtx *read-thread-id*)
              'locking-owned-mtx
-             state)
-           (update state `(writing-mtx . ,*read-thread-id*) `(read-thread . ,(thread id 3 mtx)))))
+             prog-state)
+           (update prog-state `((writing-mtx . ,*read-thread-id*) `(read-thread . ,(make-read 4 mtx f-w-index))))))
       ;; conditionally jump to line 4 or line 5
-      (3 (if writing 
-           (update state `(read-thread . ,(thread id 4 mtx)))
-           (update state `(read-thread . ,(thread id 5 mtx)))))
-      (4 (if (!= mtx 'free)
+      (4 (if writing 
+           (update prog-state `(read-thread . ,(make-read 5 mtx f-w-index)))
+           (update prog-state `(read-thread . ,(make-read 6 mtx f-w-index)))))
+      ;; try to aquire mtx, error if already holding it, set mtx local variable and the global mutex, otherwise wait
+      (5 (if (!= mtx 'free)
            (if (== mtx *read-thread-id*)
              'locking-owned-mtx
-             state)
-           (update state `(read-thread . ,(thread id 7 *read-thread-id*)))))
-      (5 (if (!= mtx 'free)
-             (if (== mtx *read-thread-id*)
-               'locking-owned-mtx
-               ;; we can't get the lock so just step line number
-               (update state `(read-thread . ,(thread id 6 mtx))))
-             ;; we can get the lock so step line number and replace mutex id
-             (update state `(mtxs . ,(update-nth f-w-index *read-thread-id* mtxs))
-                     `(read-thread . ,(thread id 7 *read-thread-id*)))))
+             prog-state)
+           (update prog-state `((mtxs . ,(update-nth f-w-index *read-thread-id* mtxs))
+                                (read-thread . ,(make-read 7 *read-thread-id* f-w-index))))))
+      ;; same as 5 but move to next line if not holding it
+      (6 (if (!= mtx 'free)
+           (if (== mtx *read-thread-id*)
+             'locking-owned-mtx
+             ;; we can't get the lock so just step line number
+             (update prog-state `((read-thread . ,(make-read 7 mtx f-w-index)))))
+           ;; we can get the lock so step line number and replace mutex id
+           (update prog-state `((mtxs . ,(update-nth f-w-index *read-thread-id* mtxs))
+                                `(read-thread . ,(make-read 8 *read-thread-id* f-w-index))))))
       ;; return statement ends the thread since write-worker is only called from std::thread
       ;; unique_locks are unlocked
-      (6 (update state `()))
-      (7 )
-      (10 ))))
+      ;; this is correct because the mutex is unlocked nowhere else
+      ;; we don't need to update the local version of the mutex because the thread ended
+      (7 (update prog-state `((mtxs . ,(update-nth f-w-index 'free mtxs))
+                              (read-thread . nil))))
+      ;; write to the file, not considering file write exceptions
+      ;; ensures that whole buffer has values
+      (8 (if (car file)
+           (let ((buf (mem-get mem (+ buff-start (* buffsize f-w-index)) (+ buff-start (* buffsize (1+ f-w-index))))))
+             (if (errorp buf)
+               buf
+               (update prog-state `((outfile . ,buf)
+                                    (read-thread . ,(make-read 11 mtx f-w-index))))))
+           'writing-to-closed-file))
+      ;; update file_write_idx = (file_write_idx + 1) % num_buffs
+      ;; also unlock unique_locks, mtx local var goes out of scope and becomes nil
+      ;; wrap around to start of loop
+      (11 (update prog-state `((mtxs . ,(update-nth f-w-index 'free mtxs))
+                               (read-thread . ,(make-read 1 nil (mod (1+ f-w-index) num-buffs))))))))
+      :skip-tests t)
 
-(definec is-valid-state (state :globals history :write-list) :bool
-  (and (is-valid-buffer state history)
+
+(definec destructor-thread (line-num :size-t start-ptr end-ptr :local-unsigned) :thread
+  (thread *write-thread-id* line-num (destructor start-ptr end-ptr)))
+
+(defdata er-indexed-list (or error indexed-list))
+(definec set-memory (mem :indexed-list st-ptr end-ptr :size-t val :bit) :er-indexed-list
+  (if (> st-ptr end-ptr)
+    'invalid-memset
+    (if (= st-ptr end-ptr)
+      mem
+      (set-memory (put-assoc st-ptr val mem) (1+ st-ptr) end-ptr val))))#|ACL2s-ToDo-Line|#
+
+
+#|
+ThreadedFileWriter::~ThreadedFileWriter()
+{
+     DEBUGLOG("Closing File Write");
+     // zero out the unused memory in the last buffer
+0    char* current_section_start = reinterpret_cast<char*>(buffer.get()) + buffsize * (buffer_write_idx - 1);
+1    char* current_section_end = current_section_start + buffsize;
+2    std::fill(current_section_start + buffer_byte_idx, current_section_end , '\0');
+     // unlock last buffer for write thread
+3    std::unique_lock lock(writing_mtx);
+4    writing = false;
+5    mtxs[buffer_write_idx].unlock();
+6    buffer_write_idx = (buffer_write_idx + 1) % num_buffs;
+7    mtxs[buffer_write_idx].lock();
+8    lock.unlock();
+     //write thread finish writing to file and end thread
+9    if (write_thread.joinable()) {
+         DEBUGLOG("Waiting for Write Thread");
+10       write_thread.join();
+     }
+     //unlock the last mutex
+11   mtxs[buffer_write_idx].unlock();
+     DEBUGLOG("Closing File");
+12   outfile.close();
+     DEBUGLOG("Done Closing File Writer");
+}
+(destructor (record (current-section-start-ptr . local-unsigned)
+                      (current-section-end-ptr . local-unsigned))))
+|#
+(definec step-destructor (prog-state :globals) :result
+  (let* ((thread (globals-write-thread prog-state))
+         (line-num (thread-atomic-num thread))
+         (locals (thread-locals thread))
+         (cur-sec-start (destructor-current-section-start-ptr locals))
+         (cur-sec-end (destructor-current-section-end-ptr locals))
+         (buff-start (globals-buffer-start prog-state))
+         (buffsize (globals-buffsize prog-state))
+         (buffer-write-idx (globals-buffer-write-idx prog-state)))
+    (match line-num
+      ;; set current-section-start local
+      (0 (update prog-state `((write-thread . ,(destructor-thread 1 (+ buff-start (* buffsize (1- buffer-write-idx))) cur-sec-end)))))
+      ;; set current-section-end local
+      (1 (update prog-state `((write-thread . ,(destructor-thread 2 cur-sec-start (+ cur-sec-start buffsize))))))
+      ;; set the rest of the memory in the current buffer section to zero
+      (2 (update prog-state `((write-thread . ,(destructor-thread 3 cur-sec-start cur-sec-end))
+                              (memory . ,(set-memory memory (+ cur-sec-start buffer-byte-idx) cur-sec-end 0)))))
+      (3 )
+      (4 )
+      (5 )
+      (6 )
+      (7 )
+      (8 )
+      (9 )
+      (10 )
+      (11 )
+      (12 )))
+  :skip-tests t)
+
+(definec is-valid-state (prog-state :globals history :write-list) :bool
+  (and (is-valid-buffer prog-state history)
        ;; this relies on having the state transitions
-       ;; (! (is-deadlocked state history))
-       (does-data-match state history)))
+       ;; (! (is-deadlocked prog-state history))
+       (does-data-match prog-state history)))
