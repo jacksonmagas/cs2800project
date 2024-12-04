@@ -584,7 +584,8 @@ void ThreadedFileWriter::write(std::byte* source, size_t num_bytes)
 
 ;; are two half open intervals non-overlapping
 (definec disjoint (s1 e1 s2 e2 :nat) :bool
-  (v (<= e1 s2) (<= e2 s1)))
+  (v (<= e1 s2) (<= e2 s1)))#|ACL2s-ToDo-Line|#
+
 
 ;; step both threads simultaneously
 ;; this will result in errors if both threads try to read/write the same value
@@ -623,7 +624,7 @@ void ThreadedFileWriter::write(std::byte* source, size_t num_bytes)
                                                                             buffsize
                                                                             (+ current-section-start buffer-byte-idx)
                                                                             current-section-end))) 'data-race)
-                        ((^ (== read-line 5) (== write-line 7) (== f-w-index buffer-write-idx)))
+                        ((^ (== read-line 5) (== write-line 7) (== f-w-index buffer-write-idx)) 'deadlock)
                         (t (step-write (step-read prev-state))))))
         (:write-fun (let ((dest-ptr (write-fun-dest-ptr write-locals))
                           (write-size (write-fun-write-size write-locals)))
@@ -632,8 +633,8 @@ void ThreadedFileWriter::write(std::byte* source, size_t num_bytes)
                                                                            buffsize
                                                                            dest-ptr
                                                                            write-size))) 'data-race)
-                       ((^ (== read-line 5) (== write-line 13) (== f-w-index buffer-write-idx)))
-                       (t (step-write (step-read prev-state))))))))))
+                       ((^ (== read-line 5) (== write-line 13) (== f-w-index buffer-write-idx)) 'deadlock)
+                       (t (step-write (step-read prev-state)) 'deadlock))))))))
 
 (defdata results (listof result))
 ;; append all values in append list and not in in list to to list
@@ -659,7 +660,6 @@ void ThreadedFileWriter::write(std::byte* source, size_t num_bytes)
   
 (definec main (buffsize num-buffs :size-t writes :write-list) :result
   (let ((initial-state (constructor buffsize num-buffs writes)))
-    (main-helper `(,initial-state) '())))#|ACL2s-ToDo-Line|#
-
+    (main-helper `(,initial-state) '())))
 
 
