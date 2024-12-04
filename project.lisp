@@ -41,14 +41,13 @@ At the end of the destructor the outfile also needs to exactly match the history
 (defdata local-signed (or nil signed))
 
 (defdata bit (range integer (0 <= _ < 2)))
-(defdata bits (listof bit))
 (defdata byte (list bit bit bit bit))
 (defdata bytes (listof byte))
 ;; this is the list of data provided per call of (write)
 (defdata write-list (listof bytes))
 
 (defdata indexed-list (alistof nat bit))
-(defdata file (list bool bits))
+(defdata file (list bool bytes))
 (defdata free 'free)
 ;; a mutex had an owner thread id or is free
 (defdata mtx (oneof nat free))
@@ -60,11 +59,12 @@ At the end of the destructor the outfile also needs to exactly match the history
 (defdata
   (local-state (oneof write-worker
                       write-fun
-                      destructor))
+                      destructor
+                      main))
   ;; mtx changed to nat or free so we can tell the difference between mtx not assigned, and mtx assigned but free
   (write-worker (record (local-mtx . maybe-mtx)
                         (file-write-index . local-unsigned)))
-  (write-fun (record (source-ptr . local-unsigned)
+  (write-fun (record (source-ptr . size-t)
                  (source-bytes . bytes)
                  (num-bytes . size-t)
                  (bytes-left . local-unsigned)
@@ -72,7 +72,8 @@ At the end of the destructor the outfile also needs to exactly match the history
                  (dest-ptr . local-unsigned)
                  (prev . local-unsigned)))
   (destructor (record (current-section-start-ptr . local-unsigned)
-                      (current-section-end-ptr . local-unsigned))))
+                      (current-section-end-ptr . local-unsigned)))
+  (main 'main))
 
 (defdata 
   ;; a thread has an id, and its local state
@@ -84,6 +85,7 @@ At the end of the destructor the outfile also needs to exactly match the history
 (defdata
   globals (record (writing . bool)
                        (writing-mtx . mtx)
+                       ;; buffsize is in bytes
                        (buffsize . size-t)
                        (num-buffs . size-t)
                        (buffer-write-idx . size-t)
@@ -209,9 +211,9 @@ At the end of the destructor the outfile also needs to exactly match the history
              buffer-byte-idx mtxs outfile buffer-start buffer-end 
              memory write-thread read-thread pending-writes)))
 
-(defdata bits-error (or bits error))
+(defdata bytes-error (or bytes error))
 ;; get the memory from a buffer
-(definec mem-get (mem :indexed-list start-idx end-idx :size-t) :bits-error
+(definec mem-get (mem :indexed-list start-idx end-idx :size-t) :bytes-error
   (if (= start-idx end-idx)
     '()
     (if (^ (assoc start-idx mem) (! (errorp (mem-get mem (1+ start-idx) end-idx))))
@@ -404,7 +406,7 @@ ThreadedFileWriter::~ThreadedFileWriter()
       ;; increment buffer-write-idx
       (6 (update prog-state `((write-thread . ,(destructor-thread 7 cur-sec-start cur-sec-end))
                               (buffer-write-idx . ,(mod (1+ buffer-write-idx) num-buffs)))))
-      ;; attempt to lock next mutex
+      ;; attempt to lock next mutex blocking
       (7 (if (== cur-mtx *write-thread-id*)
            'locking-owned-mtx
            (if (!= cur-mtx 'free)
@@ -427,6 +429,237 @@ ThreadedFileWriter::~ThreadedFileWriter()
                                  (mtxs . ,(update-nth buffer-write-idx 'free mtxs))))))
       ;; close outfile, don't change write thread
       (11 (update prog-state `((outfile . (nil ,outfile)))))))
-  :skip-tests t)#|ACL2s-ToDo-Line|#
+  :skip-tests t)
+
+
+(definec make-write (l-num :size-t src-ptr :size-t src-bytes :bytes num-bytes :size-t
+                           bytes-left write-size dest-ptr prev :local-unsigned) :thread
+  (thread *write-thread-id* l-num (write-fun src-ptr src-bytes num-bytes bytes-left write-size dest-ptr prev)))
+
+;; increments the write thread line number in write function
+(definec write+1 (write-state :thread) :thread
+  :ic (write-funp (thread-locals write-state))
+  :oc (write-funp (thread-locals (write+1 write-state)))
+  (let ((lstate (thread-locals write-state)))
+    (make-write (1+ (thread-atomic-num write-state)) (write-fun-source-ptr lstate)
+                (write-fun-source-bytes lstate) (write-fun-num-bytes lstate) (write-fun-bytes-left lstate)
+                (write-fun-write-size lstate) (write-fun-dest-ptr lstate) (write-fun-prev lstate))))
+
+;; takes memory, source memory to write starting from the 1st element until write size
+(definec memcpy (mem :indexed-list src-bytes :bytes st-ptr write-size :size-t) :indexed-list
+  (if (zp write-size)
+    mem
+    (memcpy (put-assoc st-ptr (car src-bytes) mem) (cdr src-bytes) (1+ st-ptr) (1- write-size))))
+
+#|
+void ThreadedFileWriter::write(std::byte* source, size_t num_bytes)
+{
+0   while (num_bytes > 0) {
+1       size_t bytes_left = buffsize - buffer_byte_idx;
+2       size_t write_size = std::min(bytes_left, num_bytes);
+3       num_bytes -= write_size;
+4       buffer_byte_idx += write_size;
+        //move this after line 7
+5       source += write_size;
+6       std::byte* dest = buffer.get() + (buffsize * buffer_write_idx) + buffer_byte_idx;
+7       std::memcpy(dest, source, write_size);
+8       if (buffer_byte_idx == buffsize) {
+9           size_t prev = buffer_write_idx;
+10          buffer_write_idx = (buffer_write_idx + 1) % num_buffs;
+            // lock the next one before unlocking current
+11          if (!mtxs[buffer_write_idx].try_lock()) {
+                // modeling this as a fail error, its not exactly a fail state, its just where write has to wait on read
+12              std::cerr << "Error: failed to aquire write buffer" << std::endl;
+13              mtxs[buffer_write_idx].lock();
+            }
+14          mtxs[prev].unlock();
+        }
+    }
+}
+|#
+
+(definec step-write-fun (prog-state :globals) :result
+  (let* ((thread (globals-write-thread prog-state))
+         (line-num (thread-atomic-num thread))
+         (locals (thread-locals thread))
+         (src-ptr (write-fun-source-ptr locals))
+         (src-bytes (write-fun-source-bytes locals))
+         (num-bytes (write-fun-num-bytes locals))
+         (bytes-left (write-fun-bytes-left locals))
+         (write-size (write-fun-write-size locals))
+         (dest-ptr (write-fun-dest-ptr locals))
+         (prev (write-fun-prev locals))
+         (buffer-write-idx (globals-buffer-write-idx prog-state))
+         (buffer-byte-idx (globals-buffer-byte-idx prog-state))
+         (buffer-start-idx (globals-buffer-start prog-state))
+         (num-buffs (globals-num-buffs prog-state))
+         (buffsize (globals-buffsize prog-state))
+         (mtxs (globals-mtxs prog-state))
+         (cur-mtx (nth buffer-write-idx mtxs))
+         ;; ensure prev is bound before binding prev-mtx
+         (prev-mtx (^ prev (nth prev mtxs)))
+         (memory (globals-memory prog-state)))
+    (match line-num
+      ;; step into the loop or to the end of the loops
+      (0 (if (> num-bytes 0)
+           (update prog-state `((write-thread . ,(write+1 thread))))
+           (update prog-state `((write-thread . main)))))
+      ;; set number of bytes left to write
+      (1 (update prog-state `((write-thread . ,(make-write 2 src-ptr src-bytes num-bytes (- buffsize buffer-byte-idx) write-size dest-ptr prev)))))
+      ;; set write size
+      (2 (update prog-state `((write-thread . ,(make-write 3 src-ptr src-bytes num-bytes bytes-left (min bytes-left num-bytes) dest-ptr prev)))))
+      ;; remove the current write from the number of bytes to write
+      (3 (update prog-state `((write-thread . ,(make-write 4 src-ptr src-bytes (- num-bytes write-size) bytes-left write-size dest-ptr prev)))))
+      ;; add the current write to the buffer write index
+      (4 (update prog-state `((buffer-byte-idx . ,(+ buffer-byte-idx write-size))
+                              (write-thread . ,(write+1 thread)))))
+      ;; add the current write to the start pointer of the incoming data
+      (5 (update prog-state `((write-thread . ,(make-write 6 (+ src-ptr write-size) src-bytes num-bytes bytes-left write-size dest-ptr prev)))))
+      ;; set the destination pointer to the start of where to write in the buffer
+      ;; start at the buffer start, skip forwards to the start of the current buffer, skip forwards to the write index in the buffer
+      (6 (update prog-state `((write-thread . ,(make-write 7 src-ptr src-bytes num-bytes bytes-left write-size (+ buffer-start-idx (* buffsize buffer-write-idx) buffer-byte-idx) prev)))))
+      ;; copy write-size bytes from src-bytes to memory starting at dest
+      (7 (update prog-state `((memory . ,(memcpy memory (nthcdr src-ptr src-bytes) dest-ptr write-size))
+                              (write-thread . ,(write+1 thread)))))
+      ;; check if the current buffer is full, if it's not skip back to start of loop
+      ;; no unique locks go out of scope
+      (8 (if (== buffer-byte-idx buffsize)
+           (update prog-state `((write-thread . ,(write+1 thread))))
+           (update prog-state `((write-thread . ,(make-write 0 src-ptr src-bytes num-bytes nil nil nil nil))))))
+      ;; set prev to current buffer index
+      (9 (update prog-state `((write-thread . ,(make-write 10 src-ptr src-bytes num-bytes bytes-left write-size dest-ptr buffer-write-idx)))))
+      ;; increment buffer write idx
+      (10 (update prog-state `((buffer-write-idx . ,(mod (1+ buffer-write-idx) num-buffs))
+                               (write-thread . ,(make-write 11 src-ptr src-bytes num-bytes bytes-left write-size dest-ptr prev)))))
+      ;; try getting the next buffer lock, if we can't get it goto 12, otherwise lock it and go to 14
+      (11 (if (== cur-mtx *write-thread-id*)
+            'locking-owned-mutex
+            (if (!= cur-mtx 'free)
+              (update prog-state `((write-thread . ,(make-write 12 src-ptr src-bytes num-bytes bytes-left write-size dest-ptr prev))))
+              (update prog-state `((mtxs . ,(update-nth buffer-write-idx *write-thread-id* mtxs))
+                                   (write-thread . ,(make-write 14 src-ptr src-bytes num-bytes bytes-left write-size dest-ptr prev)))))))
+      ;; choice here to have error or not, modeling without error here for now
+      (12 (update prog-state `((write-thread . ,(write+1 thread)))))
+      ;; block getting the mutex
+      (13 (if (== cur-mtx *write-thread-id*)
+            'locking-owned-mutex
+            (if (!= cur-mtx 'free)
+              prog-state
+              (update prog-state `((mtxs . ,(update-nth buffer-write-idx *write-thread-id* mtxs))
+                                   (write-thread . ,(make-write 14 src-ptr src-bytes num-bytes bytes-left write-size dest-ptr prev)))))))
+      ;; unlock prev mutex and return to start of loop, locals defined in the loop body going out of scope
+      (14 (if (!= prev-mtx *write-thread-id*)
+           'unlocking-unowned-mtx
+           (update prog-state `((write-thread . ,(make-write 0 src-ptr src-bytes num-bytes nil nil nil nil))
+                                (mtxs . ,(update-nth prev 'free mtxs))))))))
+  :skip-tests t)
+
+
+
+;; step the read thread only
+(definec step-read (prev-state :result) :result
+  (if (errorp prev-state)
+    prev-state
+    (let ((thread (globals-read-thread prev-state)))
+      (if (! thread)
+        prev-state ; thread is finished
+        (step-write-worker prev-state)))))
+
+;; step the write thread only
+(definec step-write (prev-state :result) :result
+  (if (errorp prev-state)
+    prev-state
+    (let* ((thread (globals-write-thread prev-state))
+           (locals (thread-locals thread))
+           (writes (globals-pending-writes prev-state)))
+      (match locals
+        (:main (if (endp writes)
+                 ;; no more writes so start destructor on line 0 with uninitialized locals
+                 (list nil (update prev-state `((write-thread . ,(destructor-thread 0 nil nil)))))
+                 (let ((write (car writes)))
+                   ;; we have more writes, so start make write with the next write
+                   (list t (update prev-state `((write-thread . ,(make-write 0 0 write (llen writes) nil nil nil nil))))))))
+        (:write-fun (list nil (step-write-fun prev-state)))
+        (:destructor (list nil (step-destructor prev-state)))))))
+
+;; are two half open intervals non-overlapping
+(definec disjoint (s1 e1 s2 e2 :nat) :bool
+  (v (<= e1 s2) (<= e2 s1)))
+
+;; step both threads simultaneously
+;; this will result in errors if both threads try to read/write the same value
+;; writing: write-worker 4 and destructor 4
+;; buffer:
+;; write-worker 8 (buffer-start + (buffsize * file-write-idx)) <= _ < buffsize
+;; destructor 2 (current_section_start + buffer-byte-idx) <= _ < current-section-end
+;; write-fun 7 dest <= _ < write-size
+;; it will also result in errors if both threads are waiting on a mutex (deadlock)
+;; waiting on writing mutex: write-worker 3 and destructor 3
+;; waiting on buffer mutexes:
+;; write-worker 5 file-write-idx
+;; and
+;; destructor 7 or write-fun 13 buffer-write-idx
+(definec step-both (prev-state :result) :result
+  (if (errorp prev-state)
+    prev-state
+    (let* ((read-thread (globals-read-thread prev-state))
+           (read-locals (^ read-thread (thread-locals read-thread)))
+           (f-w-index (^ read-locals (write-worker-file-write-index prev-state)))
+           (read-line (^ read-thread (thread-atomic-num read-thread)))
+           (write-thread (globals-write-thread prev-state))
+           (write-locals (thread-locals write-thread))
+           (write-line (thread-atomic-num write-thread))
+           (buffer-start (globals-buffer-start prev-state))
+           (buffsize (globals-buffsize prev-state))
+           (buffer-write-idx (globals-buffer-write-idx prev-state))
+           (buffer-byte-idx (globals-buffer-byte-idx prev-state)))
+      (match write-thread
+        (:main (step-write (step-read prev-state)))
+        (:destructor (let ((current-section-start (destructor-current-section-start-ptr write-locals))
+                           (current-section-end (destructor-current-section-end-ptr write-locals)))
+                       (cond
+                        ((^ (== read-line 4) (== write-line 4)) 'data-race)
+                        ((^ (== read-line 8) (== write-line 2) (! (disjoint (+ buffer-start (* buffsize f-w-index))
+                                                                            buffsize
+                                                                            (+ current-section-start buffer-byte-idx)
+                                                                            current-section-end))) 'data-race)
+                        ((^ (== read-line 5) (== write-line 7) (== f-w-index buffer-write-idx)))
+                        (t (step-write (step-read prev-state))))))
+        (:write-fun (let ((dest-ptr (write-fun-dest-ptr write-locals))
+                          (write-size (write-fun-write-size write-locals)))
+                      (cond
+                       ((^ (== read-line 8) (== write-line 7) (! (disjoint (+ buffer-start (* buffsize f-w-index))
+                                                                           buffsize
+                                                                           dest-ptr
+                                                                           write-size))) 'data-race)
+                       ((^ (== read-line 5) (== write-line 13) (== f-w-index buffer-write-idx)))
+                       (t (step-write (step-read prev-state))))))))))
+
+(defdata results (listof result))
+;; append all values in append list and not in in list to to list
+(definec append-if-not-in (append-list to-list in-list :results) :results
+  (if (endp append-list)
+    to-list
+    (if (in (car append-list) in-list)
+      (append-if-not-in (cdr append-list) to-list in-list)
+      (append-if-not-in (cdr append-list) (cons (car append-list) to-list) in-list))))
+
+;; take a set of results and recursively compute all possible results from that starting position
+;; measure is number of elements in seach states not in seen states
+(definec main-helper (search-states :results seen-states :results) :results
+  (if (endp search-states)
+    seen-states
+    (let* ((first (car search-states))
+           (read (step-read first))
+           (write (step-write first))
+           (both (step-both first))
+           (vals `(,read ,write ,both)))
+      (main-helper (append-if-not-in vals (cdr search-states) seen-states)
+                   (append-if-not-in vals seen-states seen-states)))))
+  
+(definec main (buffsize num-buffs :size-t writes :write-list) :result
+  (let ((initial-state (constructor buffsize num-buffs writes)))
+    (main-helper `(,initial-state) '())))#|ACL2s-ToDo-Line|#
+
 
 
